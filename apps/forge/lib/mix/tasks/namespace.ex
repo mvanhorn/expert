@@ -17,7 +17,7 @@ defmodule Mix.Tasks.Namespace do
 
   require Logger
 
-  @dev_deps [:patch, :burrito]
+  @excluded_apps [:patch, :burrito, :exqlite, :db_connection, :elixir_make, :cc_precompiler]
   # Unless explicitly added, nimble_parsec won't show up as a loaded app
   # and will therefore not be namespaced.
   @no_app_deps [:nimble_parsec]
@@ -168,7 +168,7 @@ defmodule Mix.Tasks.Namespace do
   defp init do
     discover_deps_apps()
     |> Enum.concat(@no_app_deps)
-    |> Kernel.--(@dev_deps)
+    |> Kernel.--(@excluded_apps)
     |> root_modules_for_apps()
     |> Map.merge(extra_apps())
     |> register_mappings()

@@ -32,7 +32,7 @@ defmodule Expert.Provider.Handlers.WorkspaceSymbolTest do
       ])
 
     assert_receive Messages.project_compiled(), 5000
-    assert_receive Messages.project_index_ready(), 5000
+    assert_receive Messages.project_index_ready(project: ^project), 5000
 
     Expert.Project.Store.add_projects([project])
 

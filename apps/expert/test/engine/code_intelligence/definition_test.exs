@@ -65,7 +65,7 @@ defmodule Expert.Engine.CodeIntelligence.DefinitionTest do
     EngineApi.schedule_compile(project, true)
 
     assert_receive project_compiled(), 5000
-    assert_receive project_index_ready(), 5000
+    assert_receive project_index_ready(project: ^project), 5000
 
     %{project: project}
   end
@@ -640,12 +640,12 @@ defmodule Expert.Engine.CodeIntelligence.DefinitionTest do
 
   defp index(project, referenced_uris) when is_list(referenced_uris) do
     entries = Enum.flat_map(referenced_uris, &do_index/1)
-    EngineApi.call(project, Search.Store, :replace, [entries])
+    Store.replace(project, entries)
   end
 
   defp index(project, referenced_uri) do
     entries = do_index(referenced_uri)
-    EngineApi.call(project, Search.Store, :replace, [entries])
+    Store.replace(project, entries)
   end
 
   defp do_index(referenced_uri) do

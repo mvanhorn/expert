@@ -10,6 +10,7 @@ defmodule Expert.Provider.Handlers.HoverTest do
   alias Expert.EngineApi
   alias Expert.Protocol.Convert
   alias Expert.Provider.Handlers
+  alias Expert.Search.Store
   alias Forge.Document
   alias Forge.Document.Position
   alias Forge.EngineApi.Messages
@@ -39,7 +40,7 @@ defmodule Expert.Provider.Handlers.HoverTest do
       ])
 
     assert_receive Messages.project_compiled(), 5000
-    assert_receive Messages.project_index_ready(), 5000
+    assert_receive Messages.project_index_ready(project: ^project), 5000
 
     {:ok, project: project}
   end
@@ -924,7 +925,7 @@ defmodule Expert.Provider.Handlers.HoverTest do
       {:ok, _document} = Document.Store.open_temporary(uri)
 
       {:ok, entries} = Search.Indexer.Source.index(tmp_path, code)
-      :ok = EngineApi.call(project, Search.Store, :replace, [entries])
+      :ok = Store.replace(project, entries)
 
       try do
         fun.()
@@ -959,7 +960,7 @@ defmodule Expert.Provider.Handlers.HoverTest do
 
       # index the code so delegate metadata is available
       {:ok, entries} = Search.Indexer.Source.index(tmp_path, code)
-      :ok = EngineApi.call(project, Search.Store, :replace, [entries])
+      :ok = Store.replace(project, entries)
 
       try do
         fun.()
