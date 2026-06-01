@@ -1,12 +1,18 @@
 defmodule Engine.Build.StateTest do
   use ExUnit.Case, async: false
+  use Forge.Test.EventualAssertions
   use Patch
 
+  import Forge.EngineApi.Messages
   import Forge.Test.Fixtures
 
   alias Engine.Build
   alias Engine.Build.State
+  alias Engine.Compilation.TraceBuffer
+  alias Engine.Dispatch
   alias Engine.Plugin
+  alias Engine.Search.Store
+  alias Engine.Search.Store.Backends.Ets
   alias Forge.Document
   alias Forge.Project
 
@@ -81,6 +87,7 @@ defmodule Engine.Build.StateTest do
   def with_patched_compilation(_) do
     patch(Build.Document, :compile, :ok)
     patch(Build.Project, :compile, :ok)
+    patch(Build.Project, :refresh_runtime, :ok)
     :ok
   end
 
@@ -132,6 +139,114 @@ defmodule Engine.Build.StateTest do
 
       assert_called(Build.Project.compile(_, false))
     end
+  end
+
+  describe "project compilation and search indexing" do
+    test "application child order still enables search indexing after initial compile" do
+      {project, create_index, update_index} = project_with_index_callbacks()
+
+      start_supervised!(Engine.ApplicationCache)
+      start_supervised!(Engine.Compilation.TraceBuffer)
+      start_supervised!(Build)
+      start_supervised!(Ets)
+      start_supervised!({Store, [project, create_index, update_index]})
+
+      patch(Build.Project, :compile, :ok)
+      patch(Build.Project, :refresh_runtime, :ok)
+
+      Engine.schedule_compile(false)
+
+      assert_receive :index_started
+      assert_eventually Store.loaded?(), 1500
+    end
+
+    test "starts search indexing before runtime refresh completes" do
+      test_pid = self()
+      {project, create_index, update_index} = project_with_index_callbacks()
+
+      start_supervised!(Engine.ApplicationCache)
+      start_supervised!(Ets)
+      start_supervised!({Store, [project, create_index, update_index]})
+      start_supervised!(Build)
+
+      Dispatch.register_listener(self(), [project_compiled()])
+
+      patch(Build.Project, :compile, :ok)
+
+      patch(Build.Project, :refresh_runtime, fn ^project ->
+        send(test_pid, {:refresh_started, self()})
+
+        receive do
+          :finish_refresh -> :ok
+        end
+      end)
+
+      Build.schedule_compile(project, false)
+
+      assert_receive project_compiled(status: :success)
+      assert_receive :index_started
+      assert_receive {:refresh_started, refresh_pid}
+
+      send(refresh_pid, :finish_refresh)
+      assert_eventually Store.loaded?(), 1500
+
+      Build.schedule_compile(project, false)
+
+      assert_receive project_compiled(status: :success)
+      assert_receive {:refresh_started, refresh_pid}
+
+      send(refresh_pid, :finish_refresh)
+    end
+
+    test "starts search indexing after project trace commit completes" do
+      test_pid = self()
+      {project, create_index, update_index} = project_with_index_callbacks()
+
+      start_supervised!(Engine.ApplicationCache)
+      start_supervised!(Ets)
+      start_supervised!({Store, [project, create_index, update_index]})
+      start_supervised!(Build)
+
+      Dispatch.register_listener(self(), [project_compiled()])
+
+      patch(Build.Project, :compile, :ok)
+      patch(Build.Project, :refresh_runtime, :ok)
+
+      patch(TraceBuffer, :commit_project, fn ^project ->
+        send(test_pid, {:trace_commit_started, self()})
+
+        receive do
+          :finish_trace_commit -> :ok
+        end
+      end)
+
+      Build.schedule_compile(project, false)
+
+      assert_receive {:trace_commit_started, trace_commit_pid}
+      refute_receive project_compiled(), 100
+      refute_receive :index_started, 100
+
+      send(trace_commit_pid, :finish_trace_commit)
+
+      assert_receive project_compiled(status: :success)
+      assert_receive :index_started
+      assert_eventually Store.loaded?(), 1500
+    end
+  end
+
+  defp project_with_index_callbacks do
+    test_pid = self()
+    project = Project.new("file://#{Path.join(fixtures_path(), "project_metadata")}")
+    Engine.set_project(project)
+
+    create_index = fn ^project, _backend ->
+      send(test_pid, :index_started)
+      :ok
+    end
+
+    update_index = fn ^project, _backend -> :ok end
+
+    {project, create_index, update_index}
   end
 
   describe "mixed compilation" do

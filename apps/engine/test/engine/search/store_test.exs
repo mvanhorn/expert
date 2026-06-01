@@ -193,6 +193,85 @@ defmodule Engine.Search.StoreTest do
         assert found.id == 2
         assert found.subject == Present
       end
+
+      test "repeated trace definition replacements do not duplicate fuzzy matches" do
+        path = "/path/to/expert.ex"
+
+        entry =
+          definition(
+            id: 201,
+            path: path,
+            subject: "Expert.handle_request/2",
+            type: {:function, :public}
+          )
+
+        for _ <- 1..3 do
+          assert :ok = Store.commit_trace(path, [Expert], [entry])
+        end
+
+        entry_id = entry.id
+
+        assert %{fuzzy: %{subject_to_values: %{"handle_request" => [^entry_id]}}} =
+                 store_state()
+
+        assert {:ok, [^entry]} = Store.fuzzy("handle_request", [])
+      end
+    end
+
+    describe "#{backend_name} :: trace writes during stale restart" do
+      test "trace references do not duplicate definitions after a stale restart update", %{
+        project: project
+      } do
+        path = "/path/to/expert.ex"
+
+        old_definition =
+          definition(
+            id: 201,
+            path: path,
+            subject: "Expert.handle_request/2",
+            type: {:function, :public}
+          )
+
+        new_definition =
+          definition(
+            id: 202,
+            path: path,
+            subject: "Expert.handle_request/2",
+            type: {:function, :public}
+          )
+
+        trace_reference =
+          reference(
+            id: 301,
+            path: path,
+            subject: "Enum.map/2",
+            type: {:function, :usage}
+          )
+
+        update = fn _, backend ->
+          with {:ok, _} <- backend.delete_by_path(path) do
+            backend.insert([new_definition])
+          end
+        end
+
+        {:ok, backend: backend} = with_a_started_store(project, unquote(backend), update)
+
+        assert :ok = Store.commit_trace(path, [Expert], [old_definition, trace_reference])
+        flush_store()
+
+        assert_eventually Enum.any?(all_entries(backend), &(&1.id == trace_reference.id)), 1500
+
+        restart_store()
+
+        assert {:ok, [^new_definition]} = Store.fuzzy("handle_request", [])
+
+        assert [^new_definition] =
+                 backend
+                 |> all_entries()
+                 |> Enum.filter(
+                   &(&1.subject == "Expert.handle_request/2" and &1.subtype == :definition)
+                 )
+      end
     end
 
     describe "#{backend_name} :: structure queries " do
@@ -248,7 +327,7 @@ defmodule Engine.Search.StoreTest do
         assert second_fun.subject == "Parent.fun2/1"
       end
 
-      test "findidng siblings of a non-existent entry" do
+      test "finding siblings of a non-existent entry" do
         assert :error = Store.siblings(%Entry{})
       end
 
@@ -368,12 +447,12 @@ defmodule Engine.Search.StoreTest do
     :ok
   end
 
-  defp with_a_started_store(project, backend) do
+  defp with_a_started_store(project, backend, update \\ &default_update/2) do
     destroy_backend(backend, project)
 
     start_supervised!(Dispatch)
     start_supervised!(backend)
-    start_supervised!({Store, [project, &default_create/2, &default_update/2, backend]})
+    start_supervised!({Store, [project, &default_create/2, update, backend]})
 
     assert_eventually alive?()
 
@@ -386,6 +465,38 @@ defmodule Engine.Search.StoreTest do
     end)
 
     {:ok, backend: backend}
+  end
+
+  defp restart_store do
+    ref =
+      Store
+      |> Process.whereis()
+      |> Process.monitor()
+
+    Store.stop()
+
+    receive do
+      {:DOWN, ^ref, _, _, _} ->
+        assert_eventually alive?()
+        Store.enable()
+        assert_eventually ready?(), 1500
+    after
+      1000 ->
+        raise "Could not stop store"
+    end
+  end
+
+  defp flush_store do
+    Store
+    |> Process.whereis()
+    |> send(:flush_updates)
+  end
+
+  defp store_state do
+    case :sys.get_state(Store) do
+      {_ref, state} -> state
+      state -> state
+    end
   end
 
   def ready? do

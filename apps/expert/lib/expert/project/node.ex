@@ -73,8 +73,7 @@ defmodule Expert.Project.Node do
 
   @impl GenServer
   def handle_continue(:trigger_build, %State{} = state) do
-    EngineApi.schedule_compile(state.project, true)
-    {:noreply, state}
+    schedule_build(state)
   end
 
   @impl true
@@ -84,8 +83,7 @@ defmodule Expert.Project.Node do
 
   @impl GenServer
   def handle_cast(:trigger_build, %State{} = state) do
-    EngineApi.schedule_compile(state.project, true)
-    {:noreply, state}
+    schedule_build(state)
   end
 
   @impl GenServer
@@ -103,6 +101,11 @@ defmodule Expert.Project.Node do
 
   # private api
 
+  defp schedule_build(%State{} = state) do
+    EngineApi.schedule_compile(state.project, false)
+    {:noreply, state}
+  end
+
   defp start_node(%Project{} = project, token \\ Progress.noop_token()) do
     with {:ok, node, node_pid} <- EngineNode.start(project, token) do
       Node.monitor(node, true)
@@ -119,12 +122,10 @@ defmodule Expert.Project.Node do
     end
   end
 
-  defp bootstrap_error_message(reason) do
-    case reason do
-      :eacces -> "Project directory has insufficient permissions. It needs to be writable."
-      :erofs -> "Project is in a read-only filesystem"
-      :enospc -> "No disk space available"
-      _ -> "Unable to bootstrap engine: #{inspect(reason)}"
-    end
-  end
+  defp bootstrap_error_message(:eacces),
+    do: "Project directory has insufficient permissions. It needs to be writable."
+
+  defp bootstrap_error_message(:erofs), do: "Project is in a read-only filesystem"
+  defp bootstrap_error_message(:enospc), do: "No disk space available"
+  defp bootstrap_error_message(reason), do: "Unable to bootstrap engine: #{inspect(reason)}"
 end

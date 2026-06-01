@@ -31,6 +31,7 @@ defmodule Engine.Search.Store do
           (project :: Project.t(), backend :: module() -> index_result())
 
   @backend Application.compile_env(:engine, :search_store_backend, Store.Backends.Ets)
+  @enabled_key {__MODULE__, :enabled?}
   @flush_interval_ms Application.compile_env(
                        :engine,
                        :search_store_quiescent_period_ms,
@@ -106,6 +107,20 @@ defmodule Engine.Search.Store do
     GenServer.call(__MODULE__, {:update, path, entries})
   end
 
+  def commit_trace(path, modules, entries)
+      when is_binary(path) and is_list(modules) and is_list(entries) do
+    call_if_started({:commit_trace, Path.expand(path), modules, entries}, :ok)
+  end
+
+  def commit_traces(trace_updates) when is_list(trace_updates) do
+    trace_updates =
+      Enum.map(trace_updates, fn {path, modules, entries} ->
+        {Path.expand(path), modules, entries}
+      end)
+
+    call_if_started({:commit_traces, trace_updates}, :ok)
+  end
+
   def destroy do
     GenServer.call(__MODULE__, :destroy)
   end
@@ -152,19 +167,22 @@ defmodule Engine.Search.Store do
     # the search store enables itself, at which point we index the code.
 
     Engine.register_listener(self(), project_compiled())
+
     state = State.new(project, create_index, update_index, backend)
+
     {:ok, state}
   end
 
   @impl GenServer
-  # enable ourselves when the project is force compiled
   def handle_info(project_compiled(), %State{} = state) do
+    {:ok, state} = State.flush_buffered_updates(state)
     {:noreply, enable(state)}
   end
 
-  def handle_info(project_compiled(), {_, _} = state) do
-    # we're already enabled, no need to do anything
-    {:noreply, state}
+  def handle_info(project_compiled(), {ref, %State{} = state}) do
+    {:ok, state} = State.flush_buffered_updates(state)
+    maybe_broadcast_index_ready(state)
+    {:noreply, {ref, state}}
   end
 
   # handle the result from `State.async_load/1`
@@ -229,27 +247,13 @@ defmodule Engine.Search.Store do
   end
 
   def handle_call(:refresh_index, _from, {ref, %State{} = state}) do
-    {reply, new_state} =
-      case State.refresh_index(state) do
-        {:ok, new_state} ->
-          {:ok, new_state}
-
-        {:error, _} = error ->
-          {error, state}
-      end
+    {reply, new_state} = run_index_operation(state, &State.refresh_index/1)
 
     {:reply, reply, {ref, new_state}}
   end
 
   def handle_call(:rebuild_index, _from, {ref, %State{} = state}) do
-    {reply, new_state} =
-      case State.rebuild_index(state) do
-        {:ok, new_state} ->
-          {:ok, new_state}
-
-        {:error, _} = error ->
-          {error, state}
-      end
+    {reply, new_state} = run_index_operation(state, &State.rebuild_index/1)
 
     {:reply, reply, {ref, new_state}}
   end
@@ -257,29 +261,25 @@ defmodule Engine.Search.Store do
   def handle_call({:exact, subject, constraints}, _from, {ref, %State{} = state}) do
     state
     |> State.exact(subject, constraints)
-    |> maybe_broadcast_loading(state)
-    |> then(&{:reply, &1, {ref, state}})
+    |> reply_with_search_result(state, {ref, state})
   end
 
   def handle_call({:prefix, prefix, constraints}, _from, {ref, %State{} = state}) do
     state
     |> State.prefix(prefix, constraints)
-    |> maybe_broadcast_loading(state)
-    |> then(&{:reply, &1, {ref, state}})
+    |> reply_with_search_result(state, {ref, state})
   end
 
   def handle_call({:fuzzy, subject, constraints}, _from, {ref, %State{} = state}) do
     state
     |> State.fuzzy(subject, constraints)
-    |> maybe_broadcast_loading(state)
-    |> then(&{:reply, &1, {ref, state}})
+    |> reply_with_search_result(state, {ref, state})
   end
 
   def handle_call({:all, constraints}, _from, {ref, %State{} = state}) do
     state
     |> State.all(constraints)
-    |> maybe_broadcast_loading(state)
-    |> then(&{:reply, &1, {ref, state}})
+    |> reply_with_search_result(state, {ref, state})
   end
 
   def handle_call({:update, path, entries}, _from, {ref, %State{} = state}) do
@@ -288,18 +288,44 @@ defmodule Engine.Search.Store do
     {:reply, reply, {new_ref, new_state}}
   end
 
+  def handle_call({:commit_trace, path, modules, entries}, _from, {ref, %State{} = state}) do
+    case State.commit_trace(state, path, modules, entries) do
+      {:ok, state} -> {:reply, :ok, {schedule_flush(ref), state}}
+      {:error, _} = error -> {:reply, error, {ref, state}}
+    end
+  end
+
+  def handle_call({:commit_traces, trace_updates}, _from, {ref, %State{} = state}) do
+    case State.commit_traces(state, trace_updates) do
+      {:ok, state} -> {:reply, :ok, {schedule_flush(ref), state}}
+      {:error, _} = error -> {:reply, error, {ref, state}}
+    end
+  end
+
+  def handle_call({:commit_trace, path, modules, entries}, _from, %State{} = state) do
+    case State.commit_trace(state, path, modules, entries) do
+      {:ok, state} -> {:reply, :ok, state}
+      {:error, _} = error -> {:reply, error, state}
+    end
+  end
+
+  def handle_call({:commit_traces, trace_updates}, _from, %State{} = state) do
+    case State.commit_traces(state, trace_updates) do
+      {:ok, state} -> {:reply, :ok, state}
+      {:error, _} = error -> {:reply, error, state}
+    end
+  end
+
   def handle_call({:parent, entry}, _from, {_, %State{} = state} = orig_state) do
     state
     |> State.parent(entry)
-    |> maybe_broadcast_loading(state)
-    |> then(&{:reply, &1, orig_state})
+    |> reply_with_search_result(state, orig_state)
   end
 
   def handle_call({:siblings, entry}, _from, {_, %State{} = state} = orig_state) do
     state
     |> State.siblings(entry)
-    |> maybe_broadcast_loading(state)
-    |> then(&{:reply, &1, orig_state})
+    |> reply_with_search_result(state, orig_state)
   end
 
   def handle_call(
@@ -309,8 +335,7 @@ defmodule Engine.Search.Store do
       ) do
     state
     |> State.resolve_mfa(module, function, arity)
-    |> maybe_broadcast_loading(state)
-    |> then(&{:reply, &1, orig_state})
+    |> reply_with_search_result(state, orig_state)
   end
 
   def handle_call(:on_stop, _, {ref, %State{} = state}) do
@@ -340,13 +365,28 @@ defmodule Engine.Search.Store do
   end
 
   @impl GenServer
-  def terminate(_reason, {_, state}) do
+  def terminate(reason, {_, %State{} = state}) do
+    terminate(reason, state)
+  end
+
+  def terminate(_reason, %State{} = state) do
     {:ok, state} = State.flush_buffered_updates(state)
     {:noreply, state}
   end
 
   defp backend do
     @backend
+  end
+
+  defp reply_with_search_result(result, %State{} = state, server_state) do
+    {:reply, maybe_broadcast_loading(result, state), server_state}
+  end
+
+  defp run_index_operation(%State{} = state, operation) when is_function(operation, 1) do
+    case operation.(state) do
+      {:ok, new_state} -> {:ok, new_state}
+      {:error, _} = error -> {error, state}
+    end
   end
 
   defp do_update(state, old_ref, path, entries) do
@@ -367,8 +407,9 @@ defmodule Engine.Search.Store do
   end
 
   defp enable(%State{} = state) do
+    {:ok, state} = State.flush_buffered_updates(state)
     state = State.async_load(state)
-    :persistent_term.put({__MODULE__, :enabled?}, true)
+    :persistent_term.put(@enabled_key, true)
     {nil, state}
   end
 
@@ -384,8 +425,15 @@ defmodule Engine.Search.Store do
     end
   end
 
+  defp call_if_started(call, default) do
+    case Process.whereis(__MODULE__) do
+      nil -> default
+      _pid -> GenServer.call(__MODULE__, call, :infinity)
+    end
+  end
+
   defp enabled? do
-    :persistent_term.get({__MODULE__, :enabled?}, false)
+    :persistent_term.get(@enabled_key, false)
   end
 
   defp maybe_broadcast_loading({:error, :loading} = result, %State{project: project}) do
@@ -394,4 +442,10 @@ defmodule Engine.Search.Store do
   end
 
   defp maybe_broadcast_loading(result, _state), do: result
+
+  defp maybe_broadcast_index_ready(%State{loaded?: true, async_load_ref: nil, project: project}) do
+    Dispatch.broadcast(project_index_ready(project: project))
+  end
+
+  defp maybe_broadcast_index_ready(%State{}), do: :ok
 end

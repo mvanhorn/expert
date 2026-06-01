@@ -27,18 +27,9 @@ defmodule Engine.CodeIntelligence.Definition do
     module = Formats.module(entity)
 
     locations =
-      case Store.exact(module, type: type, subtype: :definition) do
-        {:ok, entries} ->
-          for entry <- entries,
-              result = to_location(entry),
-              match?({:ok, _}, result) do
-            {:ok, location} = result
-            location
-          end
-
-        _ ->
-          []
-      end
+      module
+      |> query_search_index(type: type, subtype: :definition)
+      |> entries_to_locations()
 
     maybe_fallback_to_elixir_sense(resolved, locations, analysis, position)
   end
@@ -63,15 +54,8 @@ defmodule Engine.CodeIntelligence.Definition do
             [entry]
         end
       end)
-      |> Stream.uniq_by(& &1.subject)
 
-    locations =
-      for entry <- definitions,
-          result = to_location(entry),
-          match?({:ok, _}, result) do
-        {:ok, location} = result
-        location
-      end
+    locations = entries_to_locations(definitions)
 
     maybe_fallback_to_elixir_sense(resolved, locations, analysis, position)
   end
@@ -158,6 +142,15 @@ defmodule Engine.CodeIntelligence.Definition do
         pos = {line, column}
         Entity.to_range(document, pos, pos)
     end
+  end
+
+  defp entries_to_locations(entries) do
+    Enum.flat_map(entries, fn entry ->
+      case to_location(entry) do
+        {:ok, location} -> [location]
+        :error -> []
+      end
+    end)
   end
 
   defp to_location(entry) do
